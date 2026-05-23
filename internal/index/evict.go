@@ -14,33 +14,29 @@ func DefaultEvictOptions() EvictOptions {
 
 // EvictOptions controls the behaviour of EvictStale.
 type EvictOptions struct {
-	// MaxAge is the maximum age of an index file before it is considered stale.
+	// MaxAge is the maximum age of an index file before it is removed.
 	// A zero value disables eviction.
 	MaxAge time.Duration
 }
 
 // EvictStale removes the index file at path if it is older than opts.MaxAge.
-// It returns (true, nil) when the file was removed, (false, nil) when it was
-// kept or did not exist, and (false, err) on any unexpected error.
-func EvictStale(path string, opts EvictOptions) (evicted bool, err error) {
+// If the file does not exist the call is a no-op.
+// If opts.MaxAge is zero the call is a no-op.
+func EvictStale(path string, opts EvictOptions) error {
 	if opts.MaxAge == 0 {
-		return false, nil
+		return nil
 	}
 
 	info, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return false, nil
+			return nil
 		}
-		return false, err
+		return err
 	}
 
-	if time.Since(info.ModTime()) <= opts.MaxAge {
-		return false, nil
+	if time.Since(info.ModTime()) > opts.MaxAge {
+		return os.Remove(path)
 	}
-
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return false, err
-	}
-	return true, nil
+	return nil
 }
