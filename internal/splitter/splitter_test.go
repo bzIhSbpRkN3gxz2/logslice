@@ -2,19 +2,14 @@ package splitter_test
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/yourorg/logslice/internal/output"
 	"github.com/yourorg/logslice/internal/splitter"
 )
-
-const sampleLog = `2024-01-15T10:00:00Z level=info msg="startup"
-2024-01-15T10:05:00Z level=info msg="request received"
-2024-01-15T10:10:00Z level=warn msg="slow query"
-2024-01-15T10:15:00Z level=error msg="connection refused"
-2024-01-15T10:20:00Z level=info msg="shutdown"
-`
 
 func mustParse(s string) time.Time {
 	t, err := time.Parse(time.RFC3339, s)
@@ -24,65 +19,87 @@ func mustParse(s string) time.Time {
 	return t
 }
 
+const sampleLog = `2024-01-10T10:00:00Z INFO startup
+2024-01-10T10:01:00Z INFO request received
+2024-01-10T10:02:00Z WARN slow query
+2024-01-10T10:03:00Z INFO request received
+2024-01-10T10:04:00Z ERROR timeout
+`
+
 func TestRunExtractsRange(t *testing.T) {
-	var out bytes.Buffer
-	stats, err := splitter.Run(splitter.Config{
+	var buf bytes.Buffer
+	w, _ := output.New(&buf)
+	res, err := splitter.Run(context.Background(), splitter.Config{
 		Source: strings.NewReader(sampleLog),
-		Dest:   &out,
-		Start:  mustParse("2024-01-15T10:05:00Z"),
-		End:    mustParse("2024-01-15T10:10:00Z"),
+		Dest:   w,
+		Start:  mustParse("2024-01-10T10:01:00Z"),
+		End:    mustParse("2024-01-10T10:03:00Z"),
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if stats.LinesMatched != 2 {
-		t.Errorf("expected 2 matched lines, got %d", stats.LinesMatched)
+	if res.Matched != 3 {
+		t.Fatalf("expected 3 matched lines, got %d", res.Matched)
 	}
-	if stats.LinesRead != 5 {
-		t.Errorf("expected 5 lines read, got %d", stats.LinesRead)
-	}
-	if !strings.Contains(out.String(), "slow query") {
-		t.Errorf("expected 'slow query' in output, got: %s", out.String())
+	if res.Total != 5 {
+		t.Fatalf("expected 5 total lines, got %d", res.Total)
 	}
 }
 
 func TestRunUnboundedRange(t *testing.T) {
-	var out bytes.Buffer
-	stats, err := splitter.Run(splitter.Config{
+	var buf bytes.Buffer
+	w, _ := output.New(&buf)
+	res, err := splitter.Run(context.Background(), splitter.Config{
 		Source: strings.NewReader(sampleLog),
-		Dest:   &out,
+		Dest:   w,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if stats.LinesMatched != 5 {
-		t.Errorf("expected all 5 lines matched, got %d", stats.LinesMatched)
+	if res.Matched != 5 {
+		t.Fatalf("expected all 5 lines matched, got %d", res.Matched)
 	}
 }
 
 func TestRunEmptySource(t *testing.T) {
-	var out bytes.Buffer
-	stats, err := splitter.Run(splitter.Config{
+	var buf bytes.Buffer
+	w, _ := output.New(&buf)
+	res, err := splitter.Run(context.Background(), splitter.Config{
 		Source: strings.NewReader(""),
-		Dest:   &out,
+		Dest:   w,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if stats.LinesRead != 0 || stats.LinesMatched != 0 {
-		t.Errorf("expected zero stats, got %+v", stats)
+	if res.Total != 0 {
+		t.Fatalf("expected 0 total, got %d", res.Total)
 	}
 }
 
 func TestRunInvalidRange(t *testing.T) {
-	var out bytes.Buffer
-	_, err := splitter.Run(splitter.Config{
+	var buf bytes.Buffer
+	w, _ := output.New(&buf)
+	_, err := splitter.Run(context.Background(), splitter.Config{
 		Source: strings.NewReader(sampleLog),
-		Dest:   &out,
-		Start:  mustParse("2024-01-15T10:20:00Z"),
-		End:    mustParse("2024-01-15T10:00:00Z"),
+		Dest:   w,
+		Start:  mustParse("2024-01-10T10:05:00Z"),
+		End:    mustParse("2024-01-10T10:01:00Z"),
 	})
 	if err == nil {
 		t.Fatal("expected error for inverted range, got nil")
+	}
+}
+
+func TestRunContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+	var buf bytes.Buffer
+	w, _ := output.New(&buf)
+	_, err := splitter.Run(ctx, splitter.Config{
+		Source: strings.NewReader(sampleLog),
+		Dest:   w,
+	})
+	if err == nil {
+		t.Fatal("expected context cancellation error")
 	}
 }

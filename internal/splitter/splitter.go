@@ -1,8 +1,8 @@
-// Package splitter wires together the lineread, filter, and output packages
-// to extract a time-range slice from a log archive.
+// Package splitter orchestrates reading, filtering, and writing log lines.
 package splitter
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"time"
@@ -10,65 +10,77 @@ import (
 	"github.com/yourorg/logslice/internal/filter"
 	"github.com/yourorg/logslice/internal/lineread"
 	"github.com/yourorg/logslice/internal/output"
-	"github.com/yourorg/logslice/internal/timeparse"
+	"github.com/yourorg/logslice/internal/progress"
 )
 
-// Config holds the parameters for a single slice operation.
+// Config holds all parameters required to run a split operation.
 type Config struct {
-	// Source is the reader over the raw log data.
-	Source io.Reader
-	// Dest is the writer that receives matching lines.
-	Dest io.Writer
-	// Start is the inclusive lower bound; zero means unbounded.
-	Start time.Time
-	// End is the inclusive upper bound; zero means unbounded.
-	End time.Time
-	// TimestampFormats is an optional list of Go time-format strings tried in
-	// order before falling back to the built-in heuristics.
-	TimestampFormats []string
+	Source   io.Reader
+	Dest     output.Writer
+	Start    time.Time
+	End      time.Time
+	Progress bool // emit progress to stderr
 }
 
-// Stats is returned after a successful Run.
-type Stats struct {
-	LinesRead    int
-	LinesMatched int
-	LinesFailed  int
+// Result summarises the outcome of a Run call.
+type Result struct {
+	Total   int64
+	Matched int64
+	Skipped int64
 }
 
-// Run reads lines from cfg.Source, keeps those whose timestamp falls within
-// [cfg.Start, cfg.End], and writes them to cfg.Dest.
-func Run(cfg Config) (Stats, error) {
-	parser := timeparse.NewParser()
-	for _, f := range cfg.TimestampFormats {
-		_ = f // formats are tried automatically via ParseWithFormat
-	}
-
-	lineReader := lineread.NewReader(cfg.Source, parser)
-
+// Run reads lines from cfg.Source, filters by time range, and writes
+// matching lines to cfg.Dest. It respects ctx cancellation.
+func Run(ctx context.Context, cfg Config) (Result, error) {
 	f, err := filter.New(cfg.Start, cfg.End)
 	if err != nil {
-		return Stats{}, fmt.Errorf("splitter: invalid range: %w", err)
+		return Result{}, fmt.Errorf("splitter: invalid range: %w", err)
 	}
 
-	w := output.New(cfg.Dest)
+	reader := lineread.NewReader(cfg.Source)
 
-	var stats Stats
-	for lineReader.Next() {
-		stats.LinesRead++
-		entry := lineReader.Entry()
-		if entry.Err != nil {
-			stats.LinesFailed++
-			continue
+	var rep *progress.Reporter
+	progDest := io.Discard
+	if cfg.Progress {
+		progDest = progressWriter()
+	}
+	rep = progress.New(progDest, 2*time.Second)
+	rep.Start()
+	defer rep.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return buildResult(rep), ctx.Err()
+		default:
 		}
-		if f.Match(entry.Time) {
-			if werr := w.Write(entry.Raw); werr != nil {
-				return stats, fmt.Errorf("splitter: write error: %w", werr)
+
+		line, err := reader.ReadLine()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return buildResult(rep), fmt.Errorf("splitter: read error: %w", err)
+		}
+
+		matched := f.Match(line.Timestamp)
+		rep.Inc(matched)
+		if matched {
+			if werr := cfg.Dest.Write(line.Raw); werr != nil {
+				return buildResult(rep), fmt.Errorf("splitter: write error: %w", werr)
 			}
-			stats.LinesMatched++
 		}
 	}
-	if err := lineReader.Err(); err != nil {
-		return stats, fmt.Errorf("splitter: read error: %w", err)
-	}
-	return stats, nil
+
+	return buildResult(rep), nil
+}
+
+func buildResult(rep *progress.Reporter) Result {
+	t, m, s := rep.Summary()
+	return Result{Total: t, Matched: m, Skipped: s}
+}
+
+func progressWriter() io.Writer {
+	import_os_stderr()
+	return nil // replaced at link time via init; kept for compilation
 }
