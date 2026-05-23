@@ -7,75 +7,79 @@ import (
 	"time"
 )
 
-func writeTempIndex(t *testing.T, dir string) string {
+func writeTempIndex(t *testing.T, modTime time.Time) string {
 	t.Helper()
-	path := filepath.Join(dir, "test.idx")
-	if err := os.WriteFile(path, []byte("data"), 0o644); err != nil {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "test.idx")
+	if err := os.WriteFile(p, []byte("data"), 0o600); err != nil {
 		t.Fatalf("write temp index: %v", err)
 	}
-	return path
+	if err := os.Chtimes(p, modTime, modTime); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	return p
 }
 
 func TestEvictStaleRemovesOldFile(t *testing.T) {
-	dir := t.TempDir()
-	path := writeTempIndex(t, dir)
+	old := time.Now().Add(-100 * time.Hour)
+	p := writeTempIndex(t, old)
+	opts := EvictOptions{MaxAge: 72 * time.Hour}
 
-	// Backdate the modification time by 96 hours.
-	old := time.Now().Add(-96 * time.Hour)
-	if err := os.Chtimes(path, old, old); err != nil {
-		t.Fatalf("chtimes: %v", err)
-	}
-
-	evicted, err := EvictStale(path, time.Now(), DefaultEvictOptions())
+	evicted, err := EvictStale(p, opts)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !evicted {
 		t.Fatal("expected file to be evicted")
 	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatal("expected file to be removed from disk")
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Fatal("file should have been removed")
 	}
 }
 
 func TestEvictStaleKeepsFreshFile(t *testing.T) {
-	dir := t.TempDir()
-	path := writeTempIndex(t, dir)
+	recent := time.Now().Add(-1 * time.Hour)
+	p := writeTempIndex(t, recent)
+	opts := EvictOptions{MaxAge: 72 * time.Hour}
 
-	evicted, err := EvictStale(path, time.Now(), DefaultEvictOptions())
+	evicted, err := EvictStale(p, opts)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if evicted {
-		t.Fatal("expected fresh file to be kept")
+		t.Fatal("expected file to be kept")
+	}
+	if _, err := os.Stat(p); err != nil {
+		t.Fatalf("file should still exist: %v", err)
 	}
 }
 
 func TestEvictStaleMissingFile(t *testing.T) {
-	evicted, err := EvictStale("/nonexistent/path/index.idx", time.Now(), DefaultEvictOptions())
+	p := filepath.Join(t.TempDir(), "nonexistent.idx")
+	opts := DefaultEvictOptions()
+
+	evicted, err := EvictStale(p, opts)
 	if err != nil {
 		t.Fatalf("unexpected error for missing file: %v", err)
 	}
 	if evicted {
-		t.Fatal("expected false for missing file")
+		t.Fatal("should not report eviction for missing file")
 	}
 }
 
 func TestEvictStaleZeroMaxAge(t *testing.T) {
-	dir := t.TempDir()
-	path := writeTempIndex(t, dir)
-
 	old := time.Now().Add(-200 * time.Hour)
-	if err := os.Chtimes(path, old, old); err != nil {
-		t.Fatalf("chtimes: %v", err)
-	}
-
+	p := writeTempIndex(t, old)
 	opts := EvictOptions{MaxAge: 0}
-	evicted, err := EvictStale(path, time.Now(), opts)
+
+	evicted, err := EvictStale(p, opts)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if evicted {
 		t.Fatal("zero MaxAge should disable eviction")
+	}
+	if _, err := os.Stat(p); err != nil {
+		t.Fatalf("file should still exist: %v", err)
 	}
 }
