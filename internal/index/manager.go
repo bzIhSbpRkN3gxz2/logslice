@@ -1,75 +1,87 @@
+// Package index provides offset-based indexing for fast log range queries.
 package index
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
 
-// Manager caches built indexes in memory and handles eviction of stale
-// on-disk index files before loading them.
+// Manager coordinates index lifecycle: build, cache, load, and eviction.
 type Manager struct {
-	mu      sync.Mutex
-	cache   map[string]*Index
-	evict   EvictOptions
-	build   BuildOptions
+	cacheDir string
+	mu       sync.Mutex
+	cache    map[string]*Index
+	maxAge   time.Duration
 }
 
-// NewManager creates a Manager with the provided options.
-func NewManager(build BuildOptions, evict EvictOptions) *Manager {
+// NewManager creates a Manager that stores index files under cacheDir.
+func NewManager(cacheDir string, maxAge time.Duration) *Manager {
 	return &Manager{
-		cache: make(map[string]*Index),
-		evict: evict,
-		build: build,
+		cacheDir: cacheDir,
+		cache:    make(map[string]*Index),
+		maxAge:   maxAge,
 	}
 }
 
-// Get returns a cached or freshly built Index for the given log file.
-// It evicts a stale on-disk index (at idxPath) before attempting to load it.
-func (m *Manager) Get(logPath, idxPath string) (*Index, error) {
+// indexPath returns the canonical path for the index of logFile.
+func (m *Manager) indexPath(logFile string) string {
+	base := filepath.Base(logFile)
+	return filepath.Join(m.cacheDir, base+".idx")
+}
+
+// Get returns a cached or freshly built index for logFile.
+// If the index file exists and is fresh it is loaded; otherwise it is rebuilt.
+func (m *Manager) Get(logFile string, opts BuildOptions) (*Index, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if idx, ok := m.cache[logPath]; ok {
+	if idx, ok := m.cache[logFile]; ok {
 		return idx, nil
 	}
 
-	// Evict stale index from disk before loading.
-	if err := EvictStale(idxPath, m.evict); err != nil {
-		return nil, fmt.Errorf("manager: evict %s: %w", idxPath, err)
+	idxPath := m.indexPath(logFile)
+	if info, err := os.Stat(idxPath); err == nil {
+		age := time.Since(info.ModTime())
+		if m.maxAge == 0 || age <= m.maxAge {
+			idx, err := Load(idxPath)
+			if err == nil {
+				m.cache[logFile] = idx
+				return idx, nil
+			}
+		}
 	}
 
-	idx, err := Load(idxPath)
+	f, err := os.Open(logFile)
 	if err != nil {
-		// Fall back to building a new index.
-		idx, err = Build(logPath, m.build)
-		if err != nil {
-			return nil, fmt.Errorf("manager: build index for %s: %w", logPath, err)
-		}
-		if saveErr := Save(idxPath, idx); saveErr != nil {
-			// Non-fatal: log the error but continue with the in-memory index.
-			_ = saveErr
-		}
+		return nil, fmt.Errorf("manager: open log file: %w", err)
+	}
+	defer f.Close()
+
+	idx, err := Build(f, opts)
+	if err != nil {
+		return nil, fmt.Errorf("manager: build index: %w", err)
 	}
 
-	m.cache[logPath] = idx
+	if err := os.MkdirAll(m.cacheDir, 0o755); err == nil {
+		_ = Save(idxPath, idx) // best-effort persist
+	}
+
+	m.cache[logFile] = idx
 	return idx, nil
 }
 
-// Invalidate removes the in-memory cached index for logPath.
-func (m *Manager) Invalidate(logPath string) {
+// Invalidate removes the in-memory and on-disk index for logFile.
+func (m *Manager) Invalidate(logFile string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.cache, logPath)
-}
 
-// CacheSize returns the number of indexes currently held in memory.
-func (m *Manager) CacheSize() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return len(m.cache)
+	delete(m.cache, logFile)
+	idxPath := m.indexPath(logFile)
+	if err := os.Remove(idxPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("manager: invalidate: %w", err)
+	}
+	return nil
 }
-
-// defaultManagerMaxAge is used when constructing a Manager via NewManager with
-// default eviction settings.
-const defaultManagerMaxAge = 72 * time.Hour
